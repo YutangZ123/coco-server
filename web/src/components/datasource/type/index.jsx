@@ -23,7 +23,8 @@ export const Types = {
   GitLab: 'gitlab',
   Gitea: 'gitea',
   Mssql: 'mssql',
-  Oracle: 'oracle'
+  Oracle: 'oracle',
+  Msteams: "ms_teams"
 };
 
 export const TypeList = ({

@@ -485,7 +485,7 @@ POST $[[SETUP_INDEX_PREFIX]]connector$[[SETUP_SCHEMA_VER]]/$[[SETUP_DOC_TYPE]]/o
   "id" : "oracle",
   "created" : "2025-09-19T00:00:00.000000+08:00",
   "updated" : "2025-09-19T00:00:00.000000+08:00",
-  "name" : "Oracle 连接器",
+  "name" : "Oracle 云文档连接器",
   "description" : "提取 Oracle 数据库数据。",
   "category" : "database",
   "icon" : "/assets/icons/connector/oracle/icon.png",
@@ -530,4 +530,36 @@ POST $[[SETUP_INDEX_PREFIX]]connector$[[SETUP_SCHEMA_VER]]/$[[SETUP_DOC_TYPE]]/s
     }
   },
   "builtin": true
- }
+}
+
+POST $[[SETUP_INDEX_PREFIX]]connector$[[SETUP_SCHEMA_VER]]/$[[SETUP_DOC_TYPE]]/ms_teams
+{
+  "id" : "ms_teams",
+  "created" : "2025-10-16T00:00:00.000000+08:00",
+  "updated" : "2025-10-16T00:00:00.000000+08:00",
+  "name" : "Microsoft Teams 云文件连接器",
+  "description": "索引 Microsoft Teams 中的团队、频道、消息、文件以及附件。",
+  "category" : "cloud",
+  "icon" : "/assets/icons/connector/ms_teams/icon.png",
+  "tags" : [
+    "Microsoft Teams",
+    "cloud"
+  ],
+  "url" : "http://coco.rs/connectors/ms_teams",
+  "assets": {
+    "icons": {
+      "default": "/assets/icons/connector/msteams/icon.png",
+      "team": "/assets/icons/connector/msteams/team.png",
+      "channel": "/assets/icons/connector/msteams/channel.png",
+      "message": "/assets/icons/connector/msteams/message.png",
+      "file": "/assets/icons/connector/msteams/file.png"
+    }
+  },
+  "config": {
+    "redirect_uri": "$[[SETUP_SERVER_ENDPOINT]]/connector/msteams/oauth_redirect",
+    "auth_url": "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+    "token_url": "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+    "graph_url": "https://graph.microsoft.com/v1.0"
+  },
+  "builtin": true
+}

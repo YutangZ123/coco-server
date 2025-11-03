@@ -69,6 +69,9 @@ export function Component() {
         // Feishu/Lark have hardcoded endpoints in backend, only need credentials
         return OAuthValidationPresets.feishuLark;
 
+      case 'msteams':
+        return OAuthValidationPresets.msteams;
+
       default:
         // For unknown connectors, default to standard validation
         // Users can override by providing validationRules prop

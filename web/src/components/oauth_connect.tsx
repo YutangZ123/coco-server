@@ -58,6 +58,15 @@ export const OAuthValidationPresets = {
     { field: 'client_id', required: true, label: 'Client ID' },
     { field: 'client_secret', required: true, label: 'Client Secret' },
   ],
+
+  msteams: [
+    { field: 'auth_url', required: true, label: 'Authorization URL' },
+    { field: 'client_id', required: true, label: 'Client ID' },
+    { field: 'client_secret', required: true, label: 'Client Secret' },
+    { field: 'redirect_url', required: true, label: 'Redirect URL' },
+    { field: 'token_url', required: true, label: 'Token URL' },
+    { field: 'scope', required: false, label: 'Scopes (optional)' },
+  ],
   
   // Example of conditional validation - require redirect_url only if not using default
   conditionalExample: [
