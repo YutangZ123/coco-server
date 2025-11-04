@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"io"
 
 	"infini.sh/coco/modules/common"
 	"infini.sh/coco/plugins/connectors"
@@ -21,6 +22,7 @@ import (
 	"infini.sh/framework/core/queue"
 	"infini.sh/framework/core/task"
 	"infini.sh/framework/core/util"
+	"infini.sh/framework/core/module"
 
 	log "github.com/cihub/seelog"
 )
@@ -165,8 +167,10 @@ func (p *Plugin) Start() error {
 				return
 			}
 
+			var err error
+
 			// Fetch syncable data sources
-			q := orm.Query{Size: p.PageSize}
+			q = orm.Query{Size: p.PageSize}
 			q.Conds = orm.And(orm.Eq("connector.id", conn.ID), orm.Eq("sync.enabled", true))
 			var results []common.DataSource
 			if err, _ = orm.SearchWithJSONMapper(&results, &q); err != nil {
@@ -430,13 +434,12 @@ func (p *Plugin) fetchTeamsGraph(connector *common.Connector, ds *common.DataSou
 		panic("invalid connector config")
 	}
 
-	cfg, err := util.NewConfigFrom(ds.Connector.Config)
-	if err != nil {
-		panic(err)
-	}
 	var obj Config
-	if err := cfg.Unpack(&obj); err != nil {
-		panic(err)
+	if ds != nil && ds.Connector.Config != nil {
+    	b, _ := json.Marshal(ds.Connector.Config) // import "encoding/json"
+    	if err := json.Unmarshal(b, &obj); err != nil {
+        	panic(err)
+    	}
 	}
 
 	token := strings.TrimSpace(obj.AccessToken)
@@ -491,17 +494,35 @@ func (p *Plugin) fetchTeamsGraph(connector *common.Connector, ds *common.DataSou
 	log.Infof("[%s connector] sync completed for datasource: ID: %s, Name: %s", ConnectorTeams, ds.ID, ds.Name)
 }
 
+// Teams → Channels → Messages (+Replies, +Attachments)
+
 func (p *Plugin) enumerateTeams(ctx *SyncContext) {
+    if ctx == nil || ctx.DataSource == nil {
+        log.Errorf("[%s] enumerateTeams: nil context/datasource", ConnectorTeams)
+        return
+    }
     url := fmt.Sprintf("%s/me/joinedTeams?$top=%d", p.BaseURL, ctx.PageSize)
+
     for url != "" {
-        body, next, _ := p.getPaged(ctx.Token, url)
+        body, next, err := p.getPaged(ctx.Token, url)
+        if err != nil {
+            log.Errorf("[%s] enumerateTeams: %v", ConnectorTeams, err)
+            break
+        }
+
+        // NOTE: If your parseTeams returns ([]graphTeam, error), use the two-value form:
         teams := parseTeams(body)
+
         for _, t := range teams {
-            folderDoc := common.CreateHierarchyPathFolderDoc(
+            // Emit a folder doc for the Team itself (root level)
+            teamFolder := common.CreateHierarchyPathFolderDoc(
                 ctx.DataSource, t.ID, t.DisplayName, []string{},
             )
+            if err := p.push(&teamFolder); err != nil {
+                log.Warnf("[%s] push team folder (%s): %v", ConnectorTeams, t.DisplayName, err)
+            }
 
-            p.push(folderDoc)
+            // Dive into channels for this team
             p.enumerateChannels(ctx, t.ID, t.DisplayName)
         }
         url = next
@@ -509,15 +530,37 @@ func (p *Plugin) enumerateTeams(ctx *SyncContext) {
 }
 
 func (p *Plugin) enumerateChannels(ctx *SyncContext, teamID, teamName string) {
+    if ctx == nil || ctx.DataSource == nil {
+        log.Errorf("[%s] enumerateChannels: nil context/datasource", ConnectorTeams)
+        return
+    }
+    if teamID == "" {
+        log.Warnf("[%s] enumerateChannels: empty teamID for team %q", ConnectorTeams, teamName)
+        return
+    }
+
     url := fmt.Sprintf("%s/teams/%s/channels?$top=%d", p.BaseURL, teamID, ctx.PageSize)
+
     for url != "" {
-        body, next, _ := p.getPaged(ctx.Token, url)
+        body, next, err := p.getPaged(ctx.Token, url)
+        if err != nil {
+            log.Errorf("[%s] enumerateChannels(%s): %v", ConnectorTeams, teamName, err)
+            break
+        }
+
+        // If your parseChannels returns ([]graphChannel, error), use the two-value form:
         chs := parseChannels(body)
+
         for _, ch := range chs {
-            folderDoc := common.CreateHierarchyPathFolderDoc(
+            // Emit a folder doc for Team/Channel
+            channelFolder := common.CreateHierarchyPathFolderDoc(
                 ctx.DataSource, ch.ID, ch.DisplayName, []string{teamName},
             )
-            p.push(folderDoc)
+            if err := p.push(&channelFolder); err != nil {
+                log.Warnf("[%s] push channel folder (%s/%s): %v", ConnectorTeams, teamName, ch.DisplayName, err)
+            }
+
+            // Messages + Files for this channel
             p.enumerateMessages(ctx, teamID, ch.ID, teamName, ch.DisplayName)
             p.enumerateChannelFiles(ctx, teamID, ch.ID, teamName, ch.DisplayName)
         }
@@ -525,33 +568,231 @@ func (p *Plugin) enumerateChannels(ctx *SyncContext, teamID, teamName string) {
     }
 }
 
+type driveItem struct {
+    ID                   string    `json:"id"`
+    Name                 string    `json:"name"`
+    WebURL               string    `json:"webUrl"`
+    Size                 int64     `json:"size"`
+    LastModifiedDateTime time.Time `json:"lastModifiedDateTime"`
+
+    LastModifiedBy struct {
+        User struct {
+            DisplayName string `json:"displayName"`
+            ID          string `json:"id"`
+        } `json:"user"`
+    } `json:"lastModifiedBy"`
+
+    File   *struct{ MimeType string `json:"mimeType"` } `json:"file,omitempty"`
+    Folder *struct {
+        ChildCount int `json:"childCount"`
+    } `json:"folder,omitempty"`
+
+    ParentReference struct {
+        DriveID string `json:"driveId"`
+    } `json:"parentReference"`
+}
+
+type filesFolderResp struct {
+    ID              string `json:"id"`
+    Name            string `json:"name"`
+    WebURL          string `json:"webUrl"`
+    ParentReference struct {
+        DriveID string `json:"driveId"`
+    } `json:"parentReference"`
+}
+
+// --- public entrypoint called from enumerateChannels ---
+func (p *Plugin) enumerateChannelFiles(ctx *SyncContext, teamID, channelID, teamName, channelName string) {
+    if ctx == nil || ctx.DataSource == nil {
+        log.Errorf("[%s] enumerateChannelFiles: nil context/datasource", ConnectorTeams)
+        return
+    }
+    if teamID == "" || channelID == "" {
+        log.Warnf("[%s] enumerateChannelFiles: missing teamID/channelID for %q/%q", ConnectorTeams, teamName, channelName)
+        return
+    }
+
+    // 1) Locate the channel’s filesFolder to learn driveId + root item id
+    filesFolderURL := fmt.Sprintf("%s/teams/%s/channels/%s/filesFolder", p.BaseURL, teamID, channelID)
+    root, err := p.getFilesFolder(ctx.Token, filesFolderURL)
+    if err != nil {
+        log.Warnf("[%s] filesFolder(%s/%s): %v", ConnectorTeams, teamName, channelName, err)
+        return
+    }
+    if root.ParentReference.DriveID == "" || root.ID == "" {
+        log.Warnf("[%s] filesFolder missing driveId/item id for %q/%q", ConnectorTeams, teamName, channelName)
+        return
+    }
+
+    // 2) Walk children under the filesFolder root
+    basePath := []string{teamName, channelName}
+    p.walkDriveChildren(ctx, root.ParentReference.DriveID, root.ID, basePath)
+}
+
+// --- helper: GET /teams/{team-id}/channels/{channel-id}/filesFolder ---
+func (p *Plugin) getFilesFolder(token, url string) (*filesFolderResp, error) {
+    req, err := http.NewRequest("GET", url, nil)
+    if err != nil { return nil, err }
+    req.Header.Set("Authorization", "Bearer "+token)
+    req.Header.Set("Accept", "application/json")
+
+    resp, err := http.DefaultClient.Do(req)
+    if err != nil { return nil, err }
+    defer resp.Body.Close()
+
+    b, err := io.ReadAll(resp.Body)
+    if err != nil { return nil, err }
+    if resp.StatusCode < 200 || resp.StatusCode > 299 {
+        return nil, fmt.Errorf("GET %s: %d %s", url, resp.StatusCode, string(b))
+    }
+
+    var out filesFolderResp
+    if err := json.Unmarshal(b, &out); err != nil {
+        return nil, err
+    }
+    return &out, nil
+}
+
+// --- helper: recursively walk /drives/{driveId}/items/{itemId}/children ---
+func (p *Plugin) walkDriveChildren(ctx *SyncContext, driveID, itemID string, path []string) {
+    listURL := fmt.Sprintf("%s/drives/%s/items/%s/children?$top=%d", p.BaseURL, driveID, itemID, ctx.PageSize)
+
+    for listURL != "" {
+        body, next, err := p.getPaged(ctx.Token, listURL)
+        if err != nil {
+            log.Errorf("[%s] list drive children: %v", ConnectorTeams, err)
+            break
+        }
+
+        // Parse page
+        var page struct {
+            Value []driveItem `json:"value"`
+        }
+        _ = json.Unmarshal(body, &page)
+
+        for _, it := range page.Value {
+            // Folders → emit folder doc and recurse
+            if it.Folder != nil {
+                folderDoc := common.CreateHierarchyPathFolderDoc(
+                    ctx.DataSource, it.ID, it.Name, path,
+                )
+                if err := p.push(&folderDoc); err != nil {
+                    log.Warnf("[%s] push folder %q: %v", ConnectorTeams, it.Name, err)
+                }
+                // Recurse into folder
+                p.walkDriveChildren(ctx, driveID, it.ID, append(path, it.Name))
+                continue
+            }
+
+            // Files → emit file doc
+            if it.File != nil {
+                // Build a Document that uses only fields available in your common.Document
+                // (Title, Content, URL, Type, Category/Subcategory/Categories, Tags, Owner/LastUpdatedBy)
+                var category, subcategory string
+                var cats []string
+                if len(path) > 0 {
+                    category = path[0]
+                    cats = append(cats, path...)
+                    if len(path) > 1 {
+                        subcategory = path[1]
+                    }
+                }
+
+                // Owner/LastUpdated from drive item (if present)
+                owner := &common.UserInfo{
+                    UserName: it.LastModifiedBy.User.DisplayName,
+                    UserID:   it.LastModifiedBy.User.ID,
+                }
+                upd := it.LastModifiedDateTime
+                var lastUpd *common.EditorInfo
+                if !upd.IsZero() || owner.UserName != "" || owner.UserID != "" {
+                    lastUpd = &common.EditorInfo{UserInfo: owner, UpdatedAt: &upd}
+                } else {
+                    owner = nil
+                }
+
+                // Source reference (no .ID field on your DataSource: use Name as a stable identifier)
+                src := common.DataSourceReference{
+                    Type: ConnectorTeams,
+                    Name: ctx.DataSource.Name,
+                    ID:   ctx.DataSource.Name, // use Name here since common.DataSource may not expose ID
+                }
+
+                doc := &common.Document{
+                    Source:        src,
+                    Type:          "file",
+                    Title:         it.Name,
+                    Content:       "",           // optional; can leave empty for files
+                    URL:           it.WebURL,    // SharePoint/Graph webUrl
+                    Category:      category,
+                    Subcategory:   subcategory,
+                    Categories:    cats,
+                    Owner:         owner,
+                    LastUpdatedBy: lastUpd,
+                    Tags:          []string{"teams", "channel", "file"},
+                    // Size: int(it.Size) // ← only set this if your Document.Size is int (it is), else omit or cast carefully
+                }
+
+                if err := p.push(doc); err != nil {
+                    log.Warnf("[%s] push file %q: %v", ConnectorTeams, it.Name, err)
+                }
+            }
+        }
+
+        listURL = next
+    }
+}
+
+
 func (p *Plugin) enumerateMessages(ctx *SyncContext, teamID, channelID, teamName, channelName string) {
+    if ctx == nil || ctx.DataSource == nil {
+        log.Errorf("[%s] enumerateMessages: nil context/datasource", ConnectorTeams)
+        return
+    }
+    if teamID == "" || channelID == "" {
+        log.Warnf("[%s] enumerateMessages: empty teamID/channelID for %s/%s", ConnectorTeams, teamName, channelName)
+        return
+    }
+
+    // Order by lastModified desc so we can short-circuit early pages in the future if needed
     url := fmt.Sprintf("%s/teams/%s/channels/%s/messages?$top=%d&$orderby=lastModifiedDateTime desc",
         p.BaseURL, teamID, channelID, ctx.PageSize)
 
     for url != "" {
-        body, next, _ := p.getPaged(ctx.Token, url)
-        msgs := parseMessages(body)
+        body, next, err := p.getPaged(ctx.Token, url)
+        if err != nil {
+            log.Errorf("[%s] enumerateMessages(%s/%s): %v", ConnectorTeams, teamName, channelName, err)
+            break
+        }
 
+        msgs := parseMessages(body) // this helper is no-error; adjust if your signature differs
         for i, m := range msgs {
+            // Incremental gating
             updatedAt := maxTime(m.LastModified, m.Created)
-
             if !ctx.LastKnown.IsZero() && !updatedAt.IsZero() && !updatedAt.After(ctx.LastKnown) {
                 continue
             }
-
+            // Track watermark
             if ctx.LatestSeen.IsZero() || updatedAt.After(*ctx.LatestSeen) {
                 *ctx.LatestSeen = updatedAt
             }
 
-            doc := buildMessageDoc(ctx, m, []string{teamName, channelName}, i)
-            p.push(doc)
+            // Build + push message doc
+            msgDoc := buildMessageDoc(ctx, m, []string{teamName, channelName}, i)
+            if err := p.push(msgDoc); err != nil {
+                log.Warnf("[%s] push message doc (%s/%s): %v", ConnectorTeams, teamName, channelName, err)
+            }
 
+            // Replies (optional)
             if m.HasReplies {
                 repliesURL := fmt.Sprintf("%s/teams/%s/channels/%s/messages/%s/replies?$top=%d&$orderby=lastModifiedDateTime desc",
                     p.BaseURL, teamID, channelID, m.ID, ctx.PageSize)
                 for repliesURL != "" {
-                    replyBody, nextReplies, _ := p.getPaged(ctx.Token, repliesURL)
+                    replyBody, nextReplies, rerr := p.getPaged(ctx.Token, repliesURL)
+                    if rerr != nil {
+                        log.Errorf("[%s] enumerateReplies(%s/%s): %v", ConnectorTeams, teamName, channelName, rerr)
+                        break
+                    }
                     replies := parseMessages(replyBody)
                     for _, r := range replies {
                         replyUpdated := maxTime(r.LastModified, r.Created)
@@ -562,19 +803,26 @@ func (p *Plugin) enumerateMessages(ctx *SyncContext, teamID, channelID, teamName
                             *ctx.LatestSeen = replyUpdated
                         }
                         replyDoc := buildMessageDoc(ctx, r, []string{teamName, channelName, "reply"}, 0)
-                        p.push(replyDoc)
+                        if err := p.push(replyDoc); err != nil {
+                            log.Warnf("[%s] push reply doc (%s/%s): %v", ConnectorTeams, teamName, channelName, err)
+                        }
                     }
                     repliesURL = nextReplies
                 }
             }
 
+            // Attachments (optional)
             attachmentsURL := fmt.Sprintf("%s/teams/%s/channels/%s/messages/%s/attachments",
                 p.BaseURL, teamID, channelID, m.ID)
-            attachmentsBody, _, _ := p.getPaged(ctx.Token, attachmentsURL)
-            attachments := parseAttachments(attachmentsBody)
-            for _, a := range attachments {
-                fileDoc := buildAttachmentDoc(ctx, a, []string{teamName, channelName})
-                p.push(fileDoc)
+            attBody, _, aerr := p.getPaged(ctx.Token, attachmentsURL)
+            if aerr == nil && len(attBody) > 0 {
+                atts := parseAttachments(attBody)
+                for _, a := range atts {
+                    attDoc := buildAttachmentDoc(ctx, a, []string{teamName, channelName})
+                    if err := p.push(attDoc); err != nil {
+                        log.Warnf("[%s] push attachment doc (%s/%s): %v", ConnectorTeams, teamName, channelName, err)
+                    }
+                }
             }
         }
 
@@ -584,3 +832,209 @@ func (p *Plugin) enumerateMessages(ctx *SyncContext, teamID, channelID, teamName
 
 
 func max(a, b int) int { if a > b { return a }; return b }
+
+// Graph entity structs
+type graphTeam struct {
+    ID          string `json:"id"`
+    DisplayName string `json:"displayName"`
+}
+
+type graphChannel struct {
+    ID          string `json:"id"`
+    DisplayName string `json:"displayName"`
+}
+
+type graphMessage struct {
+    ID           string    `json:"id"`
+    From         struct {
+        User struct {
+            DisplayName string `json:"displayName"`
+            ID          string `json:"id"`
+        } `json:"user"`
+    } `json:"from"`
+    Body struct {
+        Content string `json:"content"`
+    } `json:"body"`
+    Created      time.Time `json:"createdDateTime"`
+    LastModified time.Time `json:"lastModifiedDateTime"`
+    HasReplies   bool      `json:"hasReplies"`
+}
+
+type graphAttachment struct {
+    ID          string `json:"id"`
+    Name        string `json:"name"`
+    ContentType string `json:"contentType"`
+    ContentURL  string `json:"contentUrl"`
+}
+
+// getPaged issues a GET request with a bearer token and returns body + next link.
+func (p *Plugin) getPaged(token, url string) (body []byte, next string, err error) {
+    req, err := http.NewRequest("GET", url, nil)
+    if err != nil {
+        return nil, "", err
+    }
+    req.Header.Set("Authorization", "Bearer "+token)
+    req.Header.Set("Accept", "application/json")
+
+    resp, err := http.DefaultClient.Do(req)
+    if err != nil {
+        return nil, "", err
+    }
+    defer resp.Body.Close()
+
+    b, err := io.ReadAll(resp.Body)
+    if err != nil {
+        return nil, "", err
+    }
+    if resp.StatusCode < 200 || resp.StatusCode > 299 {
+        return nil, "", fmt.Errorf("GET %s: %d %s", url, resp.StatusCode, string(b))
+    }
+
+    var probe struct {
+        Next string `json:"@odata.nextLink"`
+    }
+    _ = json.Unmarshal(b, &probe)
+    return b, probe.Next, nil
+}
+
+// Simple JSON decoders for Teams entities
+func parseTeams(b []byte) []graphTeam {
+    var out struct {
+        Value []graphTeam `json:"value"`
+    }
+    _ = json.Unmarshal(b, &out)
+    return out.Value
+}
+
+func parseChannels(b []byte) []graphChannel {
+    var out struct {
+        Value []graphChannel `json:"value"`
+    }
+    _ = json.Unmarshal(b, &out)
+    return out.Value
+}
+
+func parseMessages(b []byte) []graphMessage {
+    var out struct {
+        Value []graphMessage `json:"value"`
+    }
+    _ = json.Unmarshal(b, &out)
+    return out.Value
+}
+
+func parseAttachments(b []byte) []graphAttachment {
+    var out struct {
+        Value []graphAttachment `json:"value"`
+    }
+    _ = json.Unmarshal(b, &out)
+    return out.Value
+}
+
+// push enqueues a document to the indexing queue
+func (p *Plugin) push(doc *common.Document) error {
+    if doc == nil {
+        return nil
+    }
+    qc := queue.SmartGetOrInitConfig(p.Queue)
+	payload, err := json.Marshal(doc)
+    if err != nil { return err }
+    return queue.Push(qc, payload)
+}
+
+// Helpers to construct Document objects for messages and attachments
+func buildMessageDoc(ctx *SyncContext, m graphMessage, path []string, idx int) *common.Document {
+    title := m.From.User.DisplayName
+    content := m.Body.Content
+    if strings.TrimSpace(content) == "" {
+        content = "(empty message)"
+    }
+
+    // Choose an "updated" timestamp: prefer LastModified, fallback to Created
+    updated := m.LastModified
+    if updated.IsZero() {
+        updated = m.Created
+    }
+
+    // Owner and LastUpdatedBy (optional but valid)
+    owner := &common.UserInfo{
+        UserName: m.From.User.DisplayName,
+        UserID:   m.From.User.ID,
+    }
+    lastUpd := &common.EditorInfo{
+        UserInfo:  owner,
+        UpdatedAt: &updated,
+    }
+
+    // Source reference must be a DataSourceReference (not a string)
+    src := common.DataSourceReference{
+        Type: ConnectorTeams,        // e.g., "msteams"
+        Name: ctx.DataSource.Name,   // datasource friendly name
+        ID:   ctx.DataSource.Name,     // datasource id
+        // Icon optional: leave empty or set if you have one
+    }
+
+    // Optional categorization: use team/channel path as categories
+    // (Top-level Category/Subcategory plus Categories[] for full path)
+    var category, subcategory string
+    var cats []string
+    if len(path) > 0 {
+        category = path[0]
+        cats = append(cats, path...)
+        if len(path) > 1 {
+            subcategory = path[1]
+        }
+    }
+
+    return &common.Document{
+        Source:        src,
+        Type:          "message",
+        Title:         title,
+        Content:       content,
+        Category:      category,
+        Subcategory:   subcategory,
+        Categories:    cats,
+        Owner:         owner,
+        LastUpdatedBy: lastUpd,
+        Tags:          []string{"teams", "channel", "message"},
+        // URL: fill with a deep link if you have one
+    }
+}
+
+func buildAttachmentDoc(ctx *SyncContext, a graphAttachment, path []string) *common.Document {
+    // Similar categorization using path
+    var category, subcategory string
+    var cats []string
+    if len(path) > 0 {
+        category = path[0]
+        cats = append(cats, path...)
+        if len(path) > 1 {
+            subcategory = path[1]
+        }
+    }
+
+    src := common.DataSourceReference{
+        Type: ConnectorTeams,
+        Name: ctx.DataSource.Name,
+        ID:   ctx.DataSource.Name,
+    }
+
+    return &common.Document{
+        Source:      src,
+        Type:        "attachment",
+        Title:       a.Name,
+        Content:     fmt.Sprintf("Attachment: %s (%s)", a.Name, a.ContentType),
+        URL:         a.ContentURL, // direct link if accessible; ok to leave empty otherwise
+        Category:    category,
+        Subcategory: subcategory,
+        Categories:  cats,
+        Tags:        []string{"teams", "channel", "attachment"},
+    }
+}
+
+// Safely compute the most recent time between two timestamps
+func maxTime(a, b time.Time) time.Time {
+    if a.After(b) {
+        return a
+    }
+    return b
+}
